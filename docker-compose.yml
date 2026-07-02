@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  fastapi-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi-microservice-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_NAME=fastapi-microservice-backend
+      - VERSION=1.0.0
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_LEVEL=INFO
+      - MAX_IMAGE_SIZE_MB=10
+      - MAX_IMAGE_DIMENSION=4096
+    volumes:
+      # Mount code for development (comment out for production)
+      - ./main.py:/app/main.py
+      - ./services:/app/services
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - backend-network
+
+networks:
+  backend-network:
+    driver: bridge

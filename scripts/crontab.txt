@@ -1,0 +1,48 @@
+# Algo Trading Cron Jobs
+# ----------------------
+# All times are UTC. ET offsets: EST = UTC-5, EDT = UTC-4 (DST Mar–Nov).
+# Adjust the UTC hours below when DST changes:
+#   EDT (Mar–Nov): add 4h  →  7:00 AM ET = 11:00 UTC
+#   EST (Nov–Mar): add 5h  →  7:00 AM ET = 12:00 UTC
+#
+# Prerequisites:
+#   export ALGO_BASE_URL=http://localhost:8000/api/v1/algo_trading
+#   (or set it in /etc/environment or the cron environment block below)
+#
+# To install: crontab scripts/crontab.txt
+# To view:    crontab -l
+# To edit:    crontab -e
+
+ALGO_BASE_URL=http://localhost:8000/api/v1/algo_trading
+SCRIPTS=/path/to/pixel-py/scripts   # ← update this path
+LOG_DIR=/path/to/pixel-py/logs      # ← update this path (mkdir -p logs first)
+
+# ============================================================
+# DAILY — Mon–Fri (trading days)
+# ============================================================
+
+# 7:00 AM ET (11:00 UTC, EDT) — Steps 1-3: sync + clean + score candidates
+# Then immediately runs step 4 (monitor). Exits non-zero if monitor fails → no trade.
+0 11 * * 1-5  $SCRIPTS/daily_trade.sh all >> $LOG_DIR/daily_$(date +\%Y-\%m-\%d).log 2>&1
+
+# 9:15 AM ET (13:15 UTC, EDT) — Step 5: preview signal (dry-run, no orders)
+15 13 * * 1-5  $SCRIPTS/daily_trade.sh preview >> $LOG_DIR/daily_$(date +\%Y-\%m-\%d).log 2>&1
+
+# 9:30 AM ET (13:30 UTC, EDT) — Step 6: submit market orders via IBKR
+30 13 * * 1-5  $SCRIPTS/daily_trade.sh trade >> $LOG_DIR/daily_$(date +\%Y-\%m-\%d).log 2>&1
+
+# ============================================================
+# MONTHLY BUILD — first Monday of the month, 7:00 AM ET
+# ============================================================
+# "1-7" means day 1–7 of the month; "1" = Monday.
+# This guarantees it runs on the first Monday of the month.
+# Build takes 30–60 min; deploy to Alpaca staging runs as the final step.
+0 11 1-7 * 1  $SCRIPTS/monthly_build.sh >> $LOG_DIR/monthly_build_$(date +\%Y-\%m).log 2>&1
+
+# ============================================================
+# MONTHLY PROMOTE — 6th Monday of the month (~5 trading days later), 7:00 AM ET
+# ============================================================
+# "8-14" = day 8–14 of the month; "1" = Monday → second Monday of the month.
+# Promotes from Alpaca paper to IBKR live after the gate check.
+# If the gate fails, check paper PnL and re-run manually: scripts/monthly_promote.sh
+0 11 8-14 * 1  $SCRIPTS/monthly_promote.sh >> $LOG_DIR/monthly_promote_$(date +\%Y-\%m).log 2>&1
