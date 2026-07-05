@@ -1691,6 +1691,8 @@ def _find_best_exit_z(
         n_trades = sum(f["n_trades"] for f in result.get("folds", []))
         score = n_trades * sharpe if sharpe > 0 else -np.inf
 
+        log(f"_find_best_exit_z::result={result}")
+
         log(f"_find_best_exit_z::exit_z={ez} n_trades={n_trades} sharpe={sharpe:.8f} score={score:.2f}")
         all_fold_trades = [t for f in result.get("folds", []) for t in f.get("trades", [])]
         for t in all_fold_trades:
@@ -1937,6 +1939,7 @@ def walk_forward_backtest(
 
     portfolio_pnl = pd.concat(all_daily_pnl).sort_index()
     metrics = _compute_backtest_metrics(portfolio_pnl, aum)
+    log(f"\n\n>>>>>walk_forward_backtest::aum={aum}, portfolio_pnl={portfolio_pnl}")
 
     return {
         "folds":     fold_results,
@@ -2962,7 +2965,7 @@ async def daily_monitor_endpoint(
 # CYCLE-2: Monthly Build
 # ===========================================================
 
-_EXIT_Z_SWEEP = [0.0, 0.5, 1.0, 1.5]
+_EXIT_Z_SWEEP = [0.0, 0.5, 1.0, 1.5, 2.0]
 
 async def run_monthly_build(
     sharpe_min: float = 0.5,
