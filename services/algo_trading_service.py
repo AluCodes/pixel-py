@@ -1423,13 +1423,14 @@ def backtest_pair_v2(
     # ----------------------------
     # 5) Dynamic sizing helper
     # ----------------------------
-    def conviction_from_z(z, entry_z, max_z):
-        abs_z = abs(z)
-        if abs_z < entry_z:
-            return 0.0
-        if max_z <= entry_z:
-            return 1.0
-        return min((abs_z - entry_z) / (max_z - entry_z), 1.0)
+    # AluTest
+    # def conviction_from_z(z, entry_z, max_z):
+    #     abs_z = abs(z)
+    #     if abs_z < entry_z:
+    #         return 0.0
+    #     if max_z <= entry_z:
+    #         return 1.0
+    #     return min((abs_z - entry_z) / (max_z - entry_z), 1.0)
 
     def compute_legs(z, beta, spread_vol_value):
         """
@@ -1445,16 +1446,21 @@ def backtest_pair_v2(
         if spread_vol_value <= 0:
             return 0.0, 0.0, 0.0, 0
 
-        conviction = conviction_from_z(z, entry_z, max_z)
-        if conviction == 0:
-            return 0.0, 0.0, 0.0, 0
+        # log(f"compute_legs::before conviction") #alutest
+        # conviction = conviction_from_z(z, entry_z, max_z) #alutest
+        # log(f"compute_legs::conviction={conviction}") #alutest
+        # if conviction == 0:
+        #     return 0.0, 0.0, 0.0, 0
+        #else:
+        #    log(f"compute_legs::conviction={conviction}") #alutest
 
         gross = (
             aum
             * risk_per_trade
-            * conviction
+            # * conviction #alutest
             / (spread_vol_value * np.sqrt(holding_days))
         )
+        # log(f"compute_legs::gross={gross}") #alutest
 
         beta_abs = abs(beta)
         weight_tom = 1.0 / (1.0 + beta_abs)
@@ -1527,6 +1533,7 @@ def backtest_pair_v2(
 
         # Long spread -> exit when |z| reverts to within exit_z of mean
         elif current_pos == +1:
+            # log(f"compute_legs::current_pos={current_pos}, z={z}, exit_z={exit_z}") #alutest
             if z >= -exit_z:
                 trades.append({
                     "entry_date": entry_date,
@@ -1562,7 +1569,9 @@ def backtest_pair_v2(
 
         # Short spread -> exit when z reverts downward to exit_z
         elif current_pos == -1:
+            # log(f"current_pos={current_pos}, z={z}, exit_z={exit_z}") # alutest
             if z <= exit_z:
+                # log(f"compute_legs::current_pos={current_pos}, z={z}, exit_z={exit_z}")
                 trades.append({
                     "entry_date": entry_date,
                     "exit_date": date,
@@ -1651,7 +1660,7 @@ def backtest_pair_v2(
         "daily_return": daily_return,
         "cumulative_return": cumulative_return,
     })
-
+    # log(f"backtest_pair_v2::results={results}, trades={trades}")
     return results, trades
 
 def _find_best_exit_z(
@@ -1673,6 +1682,7 @@ def _find_best_exit_z(
     best_result = None
 
     for ez in exit_z_candidates:
+        log(f"_find_best_exit_z::ez={ez}")
         result = walk_forward_backtest(
             prices_wide,
             train_months=train_months,
@@ -1682,7 +1692,6 @@ def _find_best_exit_z(
             max_holding_bars=max_holding_bars,
         )
         portfolio = result.get("portfolio", pd.Series(dtype=float))
-        log(f"_find_best_exit_z::exit_z={ez}, portfolio={portfolio}")
         if isinstance(portfolio, pd.Series) and not portfolio.empty and portfolio.std() > 0:
             # AUM cancels in mean/std ratio, so Sharpe is scale-invariant
             sharpe = float((portfolio.mean() * 252) / (portfolio.std() * np.sqrt(252)))
@@ -1691,9 +1700,10 @@ def _find_best_exit_z(
         n_trades = sum(f["n_trades"] for f in result.get("folds", []))
         score = n_trades * sharpe if sharpe > 0 else -np.inf
 
-        log(f"_find_best_exit_z::result={result}")
 
-        log(f"_find_best_exit_z::exit_z={ez} n_trades={n_trades} sharpe={sharpe:.8f} score={score:.2f}")
+        # log(f"_find_best_exit_z::result={result.folds}") #alutest
+
+        # log(f"_find_best_exit_z::exit_z={ez} n_trades={n_trades} sharpe={sharpe:.8f} score={score:.2f}") #alutest
         all_fold_trades = [t for f in result.get("folds", []) for t in f.get("trades", [])]
         for t in all_fold_trades:
             log(
@@ -1844,6 +1854,8 @@ def walk_forward_backtest(
         fold_pair_pnls: List[pd.Series] = []
         fold_trades: List[dict] = []
 
+        log(f"walk_forward_backtest::exit_z={exit_z}")
+
         for pair_tom, pair_jerry in selected_pairs:
             if pair_tom not in test_prices.columns or pair_jerry not in test_prices.columns:
                 continue
@@ -1858,6 +1870,9 @@ def walk_forward_backtest(
 
             p_tom   = combined[pair_tom].dropna()
             p_jerry = combined[pair_jerry].dropna()
+
+            # log(f"walk_forward_backtest::fold_start={fold_start}, p_tom={p_tom}, p_jerry={p_jerry}") # alutest
+            
 
             try:
                 results, trades = backtest_pair_v2(
@@ -1874,9 +1889,10 @@ def walk_forward_backtest(
                     holding_days=holding_days,
                     transaction_cost_bps=transaction_cost_bps,
                 )
-            except Exception:
+            except Exception as e:
+                log(f"walk_forward_backtest::fold_start={fold_start}, Exception={e}")
                 continue
-            # log(f"walk_forward_backtest::fold_start={fold_start}, results={results}")
+            # log(f"walk_forward_backtest::fold_start={fold_start}, trades={trades}") # alutest
 
             # Trim to test window only — warmup rows are discarded
             test_pnl = results["daily_pnl_after_cost"].loc[
@@ -1905,6 +1921,7 @@ def walk_forward_backtest(
                 t["pair_tom"] = pair_tom
                 t["pair_jerry"] = pair_jerry
                 t["fold_train_end"] = str(train_end_period.date())
+                # log(f"\n\n>>>>>walk_forward_backtest::t={t}") #alutest
                 fold_trades.append(t)
 
             if not test_pnl.empty:
@@ -1931,6 +1948,7 @@ def walk_forward_backtest(
             "cumulative_pnl": float(fold_portfolio.sum()),
             "trades":         fold_trades,
         })
+        # log(f"\n\n>>>>>walk_forward_backtest::aum={aum}, fold={fold_start}, fold_trades={fold_trades}") #alutest
 
         fold_start += test_months
 
@@ -1939,14 +1957,13 @@ def walk_forward_backtest(
 
     portfolio_pnl = pd.concat(all_daily_pnl).sort_index()
     metrics = _compute_backtest_metrics(portfolio_pnl, aum)
-    log(f"\n\n>>>>>walk_forward_backtest::aum={aum}, portfolio_pnl={portfolio_pnl}")
-
+    # log(f"\n\n>>>>>walk_forward_backtest::aum={aum}, portfolio_pnl={portfolio_pnl}") #alutest
+    
     return {
         "folds":     fold_results,
         "portfolio": portfolio_pnl,
         "metrics":   metrics,
     }
-
 
 def _apply_holding_stop(
     daily_pnl: pd.Series,
@@ -2138,7 +2155,7 @@ def _run_paper_trading_report(
 
     with open(output_path, "w") as f:
         json.dump(payload, f, indent=2, default=str)
-    log(f"paper_trading_report::saved to {output_path} (exit_z={best_exit_z})")
+    log(f"paper_trading_report::saved to {output_path}")
 
 
 @router.get("/paper_trading_report")
