@@ -9,7 +9,7 @@ import pandas as pd
 import requests
 import holidays
 import time as time_module
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time, date
 from zoneinfo import ZoneInfo
 import random
 from io import StringIO
@@ -1316,6 +1316,9 @@ def backtest_pair_v2(
     commission_per_order=1.0,
     min_gross_notional=0.0,
     min_conviction=0.25,
+    stop_z=3.5,
+    max_holding_bars=None,
+    reentry_cooldown_bars=5,
 ):
     """
     Backtest a pairs trading strategy with:
@@ -1366,6 +1369,16 @@ def backtest_pair_v2(
         Floor on conviction sizing. Entries occur just past entry_z where
         (|z|-entry_z)/(max_z-entry_z) ≈ 0, so without a floor nearly every
         position opens at a tiny fraction of full size.
+    stop_z : float
+        Structural-break stop. A spread stretching past ~3.5 sigma after
+        entry is more likely breaking (M&A, earnings regime change) than
+        mean-reverting; exit rather than average into a broken relationship.
+        The largest pairs-trading losses historically come from spreads
+        that never revert.
+    max_holding_bars : int or None
+        Time stop: force-exit positions held this many bars. Closes the
+        position properly (trade recorded, exit costs charged) — unlike
+        the deprecated post-hoc _apply_holding_stop which only zeroed PnL.
 
     Returns
     -------
@@ -1428,6 +1441,8 @@ def backtest_pair_v2(
     trades = []
 
     current_pos = 0
+    bars_held = 0
+    cooldown_until = -1
     entry_date = None
     entry_z_val = None
     entry_beta = None
@@ -1502,6 +1517,8 @@ def backtest_pair_v2(
 
         if pd.isna(z) or pd.isna(beta) or pd.isna(vol):
             signal.iloc[i] = current_pos
+            if current_pos != 0:
+                bars_held += 1
             if i > 0:
                 leg_tom.iloc[i] = leg_tom.iloc[i - 1]
                 leg_jerry.iloc[i] = leg_jerry.iloc[i - 1]
@@ -1510,6 +1527,16 @@ def backtest_pair_v2(
 
         # Flat -> enter (legs are sized once here and held constant until exit)
         if current_pos == 0:
+            if i < cooldown_until:
+                # Cooldown after a stop exit: z is usually still past the
+                # entry threshold on a broken/trending spread, so without
+                # this the strategy re-enters the same break next bar and
+                # stops out repeatedly.
+                leg_tom.iloc[i] = 0.0
+                leg_jerry.iloc[i] = 0.0
+                gross_exposure.iloc[i] = 0.0
+                signal.iloc[i] = 0
+                continue
             new_gross, new_leg_tom, new_leg_jerry, proposed_signal = compute_legs(z, beta, vol)
             # Entries too small to clear fixed commissions are skipped:
             # a $2.8k position paying ~$4 round-trip commission needs a
@@ -1547,48 +1574,31 @@ def backtest_pair_v2(
                 leg_jerry.iloc[i] = 0.0
                 gross_exposure.iloc[i] = 0.0
 
-        # Long spread -> exit when |z| reverts to within exit_z of mean
-        elif current_pos == +1:
-            if z >= -exit_z:
-                trades.append({
-                    "entry_date": entry_date,
-                    "exit_date": date,
-                    "direction": "Long Spread",
-                    "entry_z": entry_z_val,
-                    "exit_z": z,
-                    "entry_beta": entry_beta,
-                    "exit_beta": beta,
-                    "entry_gross": entry_gross,
-                    "entry_price_tom": entry_price_tom,
-                    "entry_price_jerry": entry_price_jerry,
-                    "exit_price_tom": prices_tom.iloc[i],
-                    "exit_price_jerry": prices_jerry.iloc[i],
-                })
-
-                current_pos = 0
-                entry_date = None
-                entry_z_val = None
-                entry_beta = None
-                entry_gross = 0.0
-                entry_price_tom = None
-                entry_price_jerry = None
-
-                leg_tom.iloc[i] = 0.0
-                leg_jerry.iloc[i] = 0.0
-                gross_exposure.iloc[i] = 0.0
+        # In position -> evaluate exits. Priority: structural stop (risk
+        # control fires first), then reversion target, then time stop.
+        elif current_pos != 0:
+            bars_held += 1
+            exit_reason = None
+            if current_pos == +1:
+                if z < -stop_z:
+                    exit_reason = "stop_z"
+                elif z >= -exit_z:
+                    exit_reason = "target"
             else:
-                # constant sizing: hold entry legs unchanged until exit
-                leg_tom.iloc[i] = leg_tom.iloc[i - 1]
-                leg_jerry.iloc[i] = leg_jerry.iloc[i - 1]
-                gross_exposure.iloc[i] = gross_exposure.iloc[i - 1]
+                if z > stop_z:
+                    exit_reason = "stop_z"
+                elif z <= exit_z:
+                    exit_reason = "target"
+            if exit_reason is None and max_holding_bars and bars_held >= max_holding_bars:
+                exit_reason = "max_holding"
 
-        # Short spread -> exit when z reverts downward to exit_z
-        elif current_pos == -1:
-            if z <= exit_z:
+            if exit_reason is not None:
+                if exit_reason in ("stop_z", "max_holding") and reentry_cooldown_bars:
+                    cooldown_until = i + reentry_cooldown_bars
                 trades.append({
                     "entry_date": entry_date,
                     "exit_date": date,
-                    "direction": "Short Spread",
+                    "direction": "Long Spread" if current_pos == +1 else "Short Spread",
                     "entry_z": entry_z_val,
                     "exit_z": z,
                     "entry_beta": entry_beta,
@@ -1598,9 +1608,11 @@ def backtest_pair_v2(
                     "entry_price_jerry": entry_price_jerry,
                     "exit_price_tom": prices_tom.iloc[i],
                     "exit_price_jerry": prices_jerry.iloc[i],
+                    "exit_reason": exit_reason,
                 })
 
                 current_pos = 0
+                bars_held = 0
                 entry_date = None
                 entry_z_val = None
                 entry_beta = None
@@ -1642,6 +1654,7 @@ def backtest_pair_v2(
             "exit_price_tom": prices_tom.iloc[last_i],
             "exit_price_jerry": prices_jerry.iloc[last_i],
             "forced_close": True,
+            "exit_reason": "fold_boundary",
         })
         leg_tom.iloc[last_i] = 0.0
         leg_jerry.iloc[last_i] = 0.0
@@ -1803,7 +1816,7 @@ def _find_best_exit_z(
                 f" | exit {t['exit_date']} z={t['exit_z']:.3f}"
                 f" tom={t.get('exit_price_tom', float('nan')):.4f} jerry={t.get('exit_price_jerry', float('nan')):.4f}"
                 f" | holding={t.get('holding_days')} pnl={t.get('pnl', 0.0):.2f}"
-                + (" | FORCED_CLOSE" if t.get("forced_close") else "")
+                f" | hl={t.get('half_life')} exit={t.get('exit_reason', 'target')}"
             )
 
         if score > best_score or best_result is None:
@@ -1813,6 +1826,36 @@ def _find_best_exit_z(
 
     log(f"\n\n_find_best_exit_z::selected exit_z={best_exit_z} (score={best_score:.2f})")
     return best_exit_z, best_result
+
+
+def _spread_half_life(s1: pd.Series, s2: pd.Series) -> float:
+    """Mean-reversion half-life (bars) of the spread s1 - beta*s2.
+
+    Fits an AR(1) on spread changes (Ornstein-Uhlenbeck discretization):
+        delta_spread_t = a + lam * spread_{t-1} + eps
+    Half-life = -ln(2) / ln(1 + lam) for -1 < lam < 0.
+
+    Returns np.inf when the spread shows no mean reversion (lam >= 0) —
+    such pairs are cointegrated on paper but untradable on any horizon.
+
+    Why this matters for selection: the cointegration p-value measures how
+    tight the historical fit is, not how FAST the spread reverts. Ranking
+    by p-value alone picks beautifully-fitted spreads that may take months
+    to revert (capital tied up) or revert intraday (untradable at daily
+    bars). The half-life is the tradability number.
+    """
+    aligned = pd.concat([s1, s2], axis=1).dropna()
+    if len(aligned) < 60:
+        return float("inf")
+    y, x = aligned.iloc[:, 0], aligned.iloc[:, 1]
+    beta = sm.OLS(y, sm.add_constant(x)).fit().params.iloc[1]
+    spread = y - beta * x
+    ds = spread.diff().dropna()
+    lag = spread.shift(1).dropna().loc[ds.index]
+    lam = sm.OLS(ds, sm.add_constant(lag)).fit().params.iloc[1]
+    if lam >= 0 or lam <= -1:
+        return float("inf")
+    return float(-np.log(2) / np.log(1.0 + lam))
 
 
 def walk_forward_backtest(
@@ -1837,6 +1880,9 @@ def walk_forward_backtest(
     min_conviction: float = 0.25,
     max_pairs_per_fold: int = 10,
     max_gross_over_aum_cap: float = 1.5,
+    min_half_life: float = 5.0,
+    max_half_life: float = 20.0,
+    stop_z: float = 3.5,
 ) -> Dict[str, Any]:
     """
     Walk-forward backtest for the pairs trading system.
@@ -1949,13 +1995,25 @@ def walk_forward_backtest(
                 pair_pvals[(a, b)] = float(pvalue_matrix[tick_idx[a], tick_idx[b]])
             selected_pairs.extend(pairs)
 
-        # Concentration: trading every pair that clears the p-value gate
-        # spread the risk budget across 50+ concurrent positions of ~$2-3k
-        # each — too small to clear fixed commissions. Keep only the K
-        # strongest cointegration relationships and size them properly.
+        # Tradability filter: cointegration is the gate, half-life is the
+        # ranking. Keep only pairs whose training-window spread reverts on
+        # a horizon we can actually trade at daily bars — too fast is
+        # noise/bid-ask bounce, too slow ties up capital and rides breaks.
+        # Ranking by p-value (the previous behavior) selects the tightest
+        # HISTORICAL fit, which is disproportionately overfit or already
+        # arbitraged; it says nothing about reversion speed.
+        pair_hl: Dict[tuple, float] = {}
+        for (a, b) in selected_pairs:
+            pair_hl[(a, b)] = _spread_half_life(train_clean[a], train_clean[b])
+        selected_pairs = [
+            p for p in selected_pairs
+            if min_half_life <= pair_hl[p] <= max_half_life
+        ]
         if max_pairs_per_fold and len(selected_pairs) > max_pairs_per_fold:
+            # Faster reversion (shorter half-life) first: more round trips
+            # per unit of capital and less exposure to structural breaks.
             selected_pairs = sorted(
-                selected_pairs, key=lambda p: pair_pvals.get(p, 1.0)
+                selected_pairs, key=lambda p: pair_hl[p]
             )[:max_pairs_per_fold]
 
         if not selected_pairs:
@@ -2005,19 +2063,22 @@ def walk_forward_backtest(
                     commission_per_order=commission_per_order,
                     min_gross_notional=min_gross_notional,
                     min_conviction=min_conviction,
+                    stop_z=stop_z,
+                    max_holding_bars=max_holding_bars,
                 )
             except Exception:
                 continue
             # log(f"walk_forward_backtest::fold_start={fold_start}, results={results}")
 
-            # Trim to test window only — warmup rows are discarded
+            # Trim to test window only — warmup rows are discarded.
+            # NOTE: the max-holding time stop is now enforced INSIDE
+            # backtest_pair_v2 (positions actually close, exit costs are
+            # charged, trades are recorded with exit_reason="max_holding").
+            # The old post-hoc _apply_holding_stop merely zeroed PnL while
+            # the position kept existing — deprecated, no longer called.
             test_pnl = results["daily_pnl_after_cost"].loc[
                 results.index > train_end_period
             ]
-
-            # Apply max holding stop: close any position held > max_holding_bars
-            signal_series = results["signal"].loc[results.index > train_end_period]
-            test_pnl = _apply_holding_stop(test_pnl, signal_series, max_holding_bars)
 
             for t in trades:
                 exit_ = pd.Timestamp(t["exit_date"])
@@ -2036,6 +2097,7 @@ def walk_forward_backtest(
                 t["holding_days"] = (exit_.date() - max(entry, train_end_period).date()).days
                 t["pair_tom"] = pair_tom
                 t["pair_jerry"] = pair_jerry
+                t["half_life"] = round(pair_hl.get((pair_tom, pair_jerry), float("nan")), 2)
                 t["fold_train_end"] = str(train_end_period.date())
                 fold_trades.append(t)
 
@@ -2099,6 +2161,9 @@ def walk_forward_backtest(
             "train_end":      str(train_end_period.date()),
             "test_end":       str(test_end_period.date()),
             "n_pairs":        len(selected_pairs),
+            "pair_half_lives": {
+                f"{a}/{b}": round(pair_hl[(a, b)], 2) for (a, b) in selected_pairs
+            },
             "n_trades":       len(fold_trades),
             "cumulative_pnl": float(fold_portfolio.sum()),
             "max_gross_exposure": round(float(fold_gross.max()), 2),
@@ -2265,10 +2330,40 @@ async def run_walk_forward_backtest(
     max_pairs_per_fold: int = 10,
     max_gross_over_aum_cap: float = 1.5,
     risk_per_trade: float = 0.02,
+    min_half_life: float = 5.0,
+    max_half_life: float = 20.0,
+    stop_z: float = 3.5,
+    test_start: Optional[str] = None,
+    end_date: Optional[str] = None,
 ):
-    """Run the walk-forward backtest and return per-fold + overall metrics."""
+    """Run the walk-forward backtest and return per-fold + overall metrics.
+
+    Date controls:
+    - test_start: first OUT-OF-SAMPLE date, e.g. "2021-01-01". The data is
+      sliced to begin train_months earlier so the first fold's training
+      window is exactly satisfied and testing starts here. Without it,
+      testing implicitly starts at (parquet start + train_months).
+    - end_date: last date included, e.g. "2024-12-31". Useful for holding
+      out recent years for later confirmation.
+    """
     parquet_path = "data/df_clean.parquet"
     prices_wide = pd.read_parquet(parquet_path)
+
+    warnings = []
+    if end_date:
+        prices_wide = prices_wide.loc[:pd.Timestamp(end_date)]
+    if test_start:
+        ts = pd.Timestamp(test_start)
+        need_from = ts - pd.DateOffset(months=train_months)
+        if prices_wide.index.min() > need_from:
+            warnings.append(
+                f"test_start={test_start} needs data from {need_from.date()} "
+                f"for a {train_months}-month training window, but the parquet "
+                f"starts {prices_wide.index.min().date()} — the first test "
+                f"fold will begin later than requested. Re-sync with an "
+                f"earlier start date."
+            )
+        prices_wide = prices_wide.loc[need_from:]
 
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(
@@ -2285,12 +2380,23 @@ async def run_walk_forward_backtest(
             max_pairs_per_fold=max_pairs_per_fold,
             max_gross_over_aum_cap=max_gross_over_aum_cap,
             risk_per_trade=risk_per_trade,
+            min_half_life=min_half_life,
+            max_half_life=max_half_life,
+            stop_z=stop_z,
         ),
     )
 
     return {
         "metrics": result["metrics"],
         "n_folds": len(result["folds"]),
+        "data_range": {
+            "start": str(prices_wide.index.min().date()),
+            "end": str(prices_wide.index.max().date()),
+            "first_test_fold_starts_after": (
+                result["folds"][0]["train_end"] if result["folds"] else None
+            ),
+        },
+        "warnings": warnings,
         "folds":   [
             {k: v for k, v in f.items() if k != "trades"}
             for f in result["folds"]
@@ -2544,22 +2650,56 @@ def _run_stooq_sync():
         save=True,
     )
 
-def _run_yfinance_sync():
+def _run_yfinance_sync(start_date: Optional[str] = None):
+    """Sync S&P 500 daily bars from yfinance.
+
+    start_date : optional 'yyyyMMdd' string. When omitted, syncs
+    incrementally from the last valid trading date already in the DB
+    (existing behavior). When provided, syncs from that date — use this
+    to backfill history, e.g. start_date=20190101 so a walk-forward with
+    test_start=2021-01-01 has its full 24-month training window.
+    """
+    if start_date:
+        start = datetime.strptime(start_date, "%Y%m%d").date()
+    else:
+        start = check_last_valid_trading_data_date_nyse()
     sp500_tickers = get_SP500_stocks()["yfinance_symbol"].dropna().tolist()
     bulk_download_yfinance(
         sp500_tickers,
-        start=check_last_valid_trading_data_date_nyse(),
+        start=start,
         end=get_previous_trading_date(),
         save=True,
     )
 
 @router.get("/sync_recent_data")
-async def sync_recent_data():
+async def sync_recent_data(start_date: Optional[str] = None):
+    """Kick off a background price sync.
+
+    start_date : optional, format yyyyMMdd (e.g. 20190101). Omit for the
+    default incremental sync from the last date already stored.
+    """
+    if start_date:
+        try:
+            parsed = datetime.strptime(start_date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"start_date must be yyyyMMdd, got '{start_date}'",
+            )
+        if parsed >= datetime.now().date():
+            raise HTTPException(
+                status_code=422,
+                detail=f"start_date {parsed} must be in the past",
+            )
     loop = asyncio.get_running_loop()
     # loop.run_in_executor(None, _run_massive_sync) #massive
     # loop.run_in_executor(None, _run_stooq_sync) # stooq
-    loop.run_in_executor(None, _run_yfinance_sync)
-    return {"message": "Sync started"}
+    loop.run_in_executor(None, lambda: _run_yfinance_sync(start_date))
+    return {
+        "message": "Sync started",
+        "mode": f"backfill from {start_date}" if start_date
+                else "incremental from last stored date",
+    }
 
 # read trading data within the specified date range
 def read_trade_data(
@@ -2607,8 +2747,25 @@ def read_trade_data(
     return df
 
 @router.get("/clean_data")
-def clean_data():
-    _clean_data()
+def clean_data(start_date: Optional[str] = None):
+    """Rebuild df_clean.parquet from the DB.
+
+    start_date : optional, format yyyyMMdd (e.g. 20190101). Omit for the
+    default behavior (last 2 years). Must match or precede the range you
+    backfilled with /sync_recent_data, or the parquet won't contain the
+    history the walk-forward needs.
+    """
+    if start_date:
+        try:
+            parsed = datetime.strptime(start_date, "%Y%m%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"start_date must be yyyyMMdd, got '{start_date}'",
+            )
+        _clean_data(start=parsed)
+    else:
+        _clean_data()
 
 def _clean_data(
     start: date | None = None,
