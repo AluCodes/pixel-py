@@ -1717,20 +1717,54 @@ def _find_best_exit_z(
             max_holding_bars=max_holding_bars,
         )
         portfolio = result.get("portfolio", pd.Series(dtype=float))
-        if isinstance(portfolio, pd.Series) and not portfolio.empty and portfolio.std() > 0:
-            # AUM cancels in mean/std ratio, so Sharpe is scale-invariant
-            sharpe = float((portfolio.mean() * 252) / (portfolio.std() * np.sqrt(252)))
-        else:
-            sharpe = 0.0
+        portfolio_cost = result.get("portfolio_cost", pd.Series(dtype=float))
+
+        # ── Cost-robustness: re-price P&L at stressed cost levels ──────────
+        # Txn cost is linear in bps for fixed turnover, so P&L at m× the base
+        # cost is: pnl_at_m = portfolio - (m - 1) * portfolio_cost.
+        # No re-run needed. The score uses the WORST Sharpe across multiples,
+        # so a config only wins if its edge survives cost stress. Fragile
+        # churn configs (tiny per-trade PnL, huge turnover) die first here.
+        # Note: days zeroed by the holding stop get slightly over-charged at
+        # m > 1 (their cost was zeroed with their pnl) — errs conservative.
+        COST_MULTIPLES = [1.0, 2.0, 4.0]
+        sharpes_by_cost: Dict[float, float] = {}
+        for m in COST_MULTIPLES:
+            if (isinstance(portfolio, pd.Series) and not portfolio.empty
+                    and portfolio.std() > 0):
+                stressed = portfolio - (m - 1.0) * portfolio_cost.reindex(
+                    portfolio.index).fillna(0.0)
+                s_std = stressed.std()
+                sharpes_by_cost[m] = (
+                    float((stressed.mean() * 252) / (s_std * np.sqrt(252)))
+                    if s_std > 0 else 0.0
+                )
+            else:
+                sharpes_by_cost[m] = 0.0
+
+        sharpe = sharpes_by_cost[1.0]
+        worst_sharpe = min(sharpes_by_cost.values())
         n_trades = sum(f["n_trades"] for f in result.get("folds", []))
-        # Sharpe is already computed on cost-adjusted P&L. Shrink toward 0
-        # when the sample is too small to trust; never reward trade count.
+        # Shrink toward 0 when the sample is too small to trust; never
+        # reward trade count. Score on the cost-stressed worst case.
         sample_weight = min(1.0, n_trades / MIN_TRADES)
-        score = sharpe * sample_weight if sharpe > 0 else -np.inf
+        score = worst_sharpe * sample_weight if worst_sharpe > 0 else -np.inf
 
         # log(f"_find_best_exit_z::result={result}") #alutest
 
-        log(f"\n\n_find_best_exit_z::exit_z={ez} n_trades={n_trades} sharpe={sharpe:.8f} score={score:.2f}, metrics={result.get("metrics")}")
+        base_bps = result.get("base_cost_bps", 0.0)
+        cost_sharpes_str = " ".join(
+            f"{base_bps * m:.0f}bps={s:.3f}" for m, s in sharpes_by_cost.items()
+        )
+        gross_info = ""
+        _m = result.get("metrics") or {}
+        if "max_gross_over_aum" in _m:
+            gross_info = (f" max_gross={_m['max_gross_exposure']}"
+                          f" ({_m['max_gross_over_aum']}x AUM)")
+        log(f"\n\n_find_best_exit_z::exit_z={ez} n_trades={n_trades}"
+            f" sharpe={sharpe:.8f} worst_case_sharpe={worst_sharpe:.4f}"
+            f" [{cost_sharpes_str}] score={score:.2f}{gross_info},"
+            f" metrics={result.get('metrics')}")
         all_fold_trades = [t for f in result.get("folds", []) for t in f.get("trades", [])]
         for t in all_fold_trades:
             log(
@@ -1805,6 +1839,8 @@ def walk_forward_backtest(
     index = prices_wide.index
     fold_results = []
     all_daily_pnl: List[pd.Series] = []
+    all_daily_cost: List[pd.Series] = []
+    all_daily_gross: List[pd.Series] = []
 
     # Build monthly period boundaries
     monthly = prices_wide.resample("ME").last()
@@ -1880,6 +1916,8 @@ def walk_forward_backtest(
 
         # ── 4. Backtest each pair on test window ─────────────────────────────
         fold_pair_pnls: List[pd.Series] = []
+        fold_pair_costs: List[pd.Series] = []   # daily txn cost at base bps
+        fold_pair_gross: List[pd.Series] = []   # daily gross dollar exposure
         fold_trades: List[dict] = []
 
         for pair_tom, pair_jerry in selected_pairs:
@@ -1952,6 +1990,12 @@ def walk_forward_backtest(
 
             if not test_pnl.empty:
                 fold_pair_pnls.append(test_pnl)
+                fold_pair_costs.append(
+                    results["daily_cost"].loc[results.index > train_end_period]
+                )
+                fold_pair_gross.append(
+                    results["gross_exposure"].loc[results.index > train_end_period]
+                )
 
         if not fold_pair_pnls:
             fold_start += test_months
@@ -1965,6 +2009,24 @@ def walk_forward_backtest(
         )
         all_daily_pnl.append(fold_portfolio)
 
+        # Aggregate daily txn cost (at base bps) — lets callers re-price
+        # P&L at any cost level without re-running: cost scales linearly
+        # in bps for fixed turnover.
+        fold_cost = (
+            pd.concat(fold_pair_costs, axis=1).fillna(0.0).sum(axis=1)
+            if fold_pair_costs else pd.Series(0.0, index=fold_portfolio.index)
+        )
+        all_daily_cost.append(fold_cost)
+
+        # Aggregate gross exposure across all concurrently open pairs.
+        # Each pair sizes itself independently at risk_per_trade of AUM,
+        # so summed gross can silently exceed real margin capacity.
+        fold_gross = (
+            pd.concat(fold_pair_gross, axis=1).fillna(0.0).sum(axis=1)
+            if fold_pair_gross else pd.Series(0.0, index=fold_portfolio.index)
+        )
+        all_daily_gross.append(fold_gross)
+
         fold_results.append({
             "fold":           fold_start,
             "train_end":      str(train_end_period.date()),
@@ -1972,23 +2034,46 @@ def walk_forward_backtest(
             "n_pairs":        len(selected_pairs),
             "n_trades":       len(fold_trades),
             "cumulative_pnl": float(fold_portfolio.sum()),
+            "max_gross_exposure": round(float(fold_gross.max()), 2),
+            "avg_gross_exposure": round(float(fold_gross.mean()), 2),
             "trades":         fold_trades,
         })
 
         fold_start += test_months
 
     if not all_daily_pnl:
-        return {"folds": [], "portfolio": pd.DataFrame(), "metrics": {}}
+        return {
+            "folds": [], "portfolio": pd.DataFrame(),
+            "portfolio_cost": pd.Series(dtype=float),
+            "portfolio_gross": pd.Series(dtype=float),
+            "base_cost_bps": transaction_cost_bps,
+            "metrics": {},
+        }
 
     portfolio_pnl = pd.concat(all_daily_pnl).sort_index()
+    portfolio_cost = pd.concat(all_daily_cost).sort_index()
+    portfolio_gross = pd.concat(all_daily_gross).sort_index()
     all_trades = [t for f in fold_results for t in f.get("trades", [])]
     metrics = _compute_backtest_metrics(portfolio_pnl, aum, trades=all_trades)
+    if metrics:
+        max_gross = float(portfolio_gross.max())
+        metrics.update({
+            "max_gross_exposure":  round(max_gross, 2),
+            "avg_gross_exposure":  round(float(portfolio_gross.mean()), 2),
+            # >1.0 means the book demands more notional than AUM —
+            # check against actual margin capacity before going live.
+            "max_gross_over_aum":  round(max_gross / aum, 3),
+            "total_txn_cost":      round(float(portfolio_cost.sum()), 2),
+        })
     # log(f"\n\n>>>>>walk_forward_backtest::aum={aum}, portfolio_pnl={portfolio_pnl}") #alutest
 
     return {
-        "folds":     fold_results,
-        "portfolio": portfolio_pnl,
-        "metrics":   metrics,
+        "folds":          fold_results,
+        "portfolio":      portfolio_pnl,
+        "portfolio_cost": portfolio_cost,
+        "portfolio_gross": portfolio_gross,
+        "base_cost_bps":  transaction_cost_bps,
+        "metrics":        metrics,
     }
 
 
