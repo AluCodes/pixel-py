@@ -1313,6 +1313,9 @@ def backtest_pair_v2(
     holding_days=5,
     transaction_cost_bps=0.0,
     annual_borrow_rate_bps=50.0,
+    commission_per_order=1.0,
+    min_gross_notional=0.0,
+    min_conviction=0.25,
 ):
     """
     Backtest a pairs trading strategy with:
@@ -1352,6 +1355,17 @@ def backtest_pair_v2(
         Annual stock-borrow fee on the short leg notional, in bps.
         50 bps ≈ cheap ETB stock; 200–500 bps for moderate HTB.
         Applied daily as: abs(short_leg_dollars) * rate / 252.
+    commission_per_order : float
+        Fixed commission per order (IBKR minimum ≈ $1). A pair entry is
+        2 orders, an exit is 2 more — ~4 × this per round trip. Percentage
+        bps modeling alone hides this floor when positions are small.
+    min_gross_notional : float
+        Skip entries whose computed gross is below this. Positions too
+        small to clear fixed commissions destroy PnL by construction.
+    min_conviction : float
+        Floor on conviction sizing. Entries occur just past entry_z where
+        (|z|-entry_z)/(max_z-entry_z) ≈ 0, so without a floor nearly every
+        position opens at a tiny fraction of full size.
 
     Returns
     -------
@@ -1430,7 +1444,10 @@ def backtest_pair_v2(
             return 0.0
         if max_z <= entry_z:
             return 1.0
-        return min((abs_z - entry_z) / (max_z - entry_z), 1.0)
+        raw = min((abs_z - entry_z) / (max_z - entry_z), 1.0)
+        # Floor: entries happen just past entry_z where raw ≈ 0, which
+        # produced positions ~2-3% of full size on nearly every trade.
+        return max(raw, min_conviction)
 
     def compute_legs(z, beta, spread_vol_value):
         """
@@ -1494,7 +1511,12 @@ def backtest_pair_v2(
         # Flat -> enter (legs are sized once here and held constant until exit)
         if current_pos == 0:
             new_gross, new_leg_tom, new_leg_jerry, proposed_signal = compute_legs(z, beta, vol)
-            if z < -entry_z:
+            # Entries too small to clear fixed commissions are skipped:
+            # a $2.8k position paying ~$4 round-trip commission needs a
+            # 14bps move just to break even on fees.
+            if new_gross < min_gross_notional:
+                new_gross, new_leg_tom, new_leg_jerry, proposed_signal = 0.0, 0.0, 0.0, 0
+            if proposed_signal != 0 and z < -entry_z:
                 current_pos = +1
                 entry_date = date
                 entry_z_val = z
@@ -1507,7 +1529,7 @@ def backtest_pair_v2(
                 leg_jerry.iloc[i] = new_leg_jerry
                 gross_exposure.iloc[i] = new_gross
 
-            elif z > entry_z:
+            elif proposed_signal != 0 and z > entry_z:
                 current_pos = -1
                 entry_date = date
                 entry_z_val = z
@@ -1645,6 +1667,13 @@ def backtest_pair_v2(
     )
     daily_cost = turnover * (transaction_cost_bps / 10000.0)
 
+    # Fixed commissions: with constant sizing, turnover only occurs on
+    # entry and exit days — 2 orders (one per leg) each time. This floor
+    # is what bps-only modeling hides: at small notionals the $/order
+    # minimum dwarfs the percentage cost.
+    daily_commission = (turnover > 0).astype(float) * 2.0 * commission_per_order
+    daily_cost = daily_cost + daily_commission
+
     # Borrow cost on the short leg: accrues daily on the lagged short notional
     short_tom   = tom_pos_lag.clip(upper=0).abs()   # positive when tom is short
     short_jerry = jerry_pos_lag.clip(upper=0).abs() # positive when jerry is short
@@ -1674,6 +1703,7 @@ def backtest_pair_v2(
         "jerry_ret": jerry_ret,
         "daily_pnl": daily_pnl,
         "daily_cost": daily_cost,
+        "daily_commission": daily_commission,
         "daily_borrow_cost": daily_borrow_cost,
         "daily_pnl_after_cost": daily_pnl_after_cost,
         "cumulative_pnl": cumulative_pnl,
@@ -1720,11 +1750,10 @@ def _find_best_exit_z(
         portfolio_cost = result.get("portfolio_cost", pd.Series(dtype=float))
 
         # ── Cost-robustness: re-price P&L at stressed cost levels ──────────
-        # Txn cost is linear in bps for fixed turnover, so P&L at m× the base
-        # cost is: pnl_at_m = portfolio - (m - 1) * portfolio_cost.
-        # No re-run needed. The score uses the WORST Sharpe across multiples,
-        # so a config only wins if its edge survives cost stress. Fragile
-        # churn configs (tiny per-trade PnL, huge turnover) die first here.
+        # portfolio_cost = bps slippage + fixed commissions. P&L at m× cost:
+        # pnl_at_m = portfolio - (m - 1) * portfolio_cost. No re-run needed.
+        # Stressing commissions along with slippage is deliberate — it
+        # covers partial fills, spread crossing, and odd-lot penalties.
         # Note: days zeroed by the holding stop get slightly over-charged at
         # m > 1 (their cost was zeroed with their pnl) — errs conservative.
         COST_MULTIPLES = [1.0, 2.0, 4.0]
@@ -1799,10 +1828,15 @@ def walk_forward_backtest(
     exit_z: float = 0.0,
     max_z: float = 4.0,
     aum: float = 100000,
-    risk_per_trade: float = 0.005,
+    risk_per_trade: float = 0.02,
     holding_days: int = 5,
     transaction_cost_bps: float = 5.0,
     max_holding_bars: int = 20,
+    commission_per_order: float = 1.0,
+    min_gross_notional: float = 5000.0,
+    min_conviction: float = 0.25,
+    max_pairs_per_fold: int = 10,
+    max_gross_over_aum_cap: float = 1.5,
 ) -> Dict[str, Any]:
     """
     Walk-forward backtest for the pairs trading system.
@@ -1902,13 +1936,27 @@ def walk_forward_backtest(
 
         # ── 3. Cointegration on training data only ───────────────────────────
         selected_pairs: List[tuple] = []
+        pair_pvals: Dict[tuple, float] = {}
         for cid in valid_clusters:
             tickers_in = [t for t in clustered[clustered == cid].index
                           if t in train_clean.columns]
             if len(tickers_in) < 2:
                 continue
-            _, _, pairs = find_cointegrated_pairs(train_clean[tickers_in], sig=coint_sig)
+            cluster_prices = train_clean[tickers_in]
+            _, pvalue_matrix, pairs = find_cointegrated_pairs(cluster_prices, sig=coint_sig)
+            tick_idx = {t: k for k, t in enumerate(cluster_prices.columns)}
+            for (a, b) in pairs:
+                pair_pvals[(a, b)] = float(pvalue_matrix[tick_idx[a], tick_idx[b]])
             selected_pairs.extend(pairs)
+
+        # Concentration: trading every pair that clears the p-value gate
+        # spread the risk budget across 50+ concurrent positions of ~$2-3k
+        # each — too small to clear fixed commissions. Keep only the K
+        # strongest cointegration relationships and size them properly.
+        if max_pairs_per_fold and len(selected_pairs) > max_pairs_per_fold:
+            selected_pairs = sorted(
+                selected_pairs, key=lambda p: pair_pvals.get(p, 1.0)
+            )[:max_pairs_per_fold]
 
         if not selected_pairs:
             fold_start += test_months
@@ -1954,6 +2002,9 @@ def walk_forward_backtest(
                     risk_per_trade=risk_per_trade,
                     holding_days=holding_days,
                     transaction_cost_bps=transaction_cost_bps,
+                    commission_per_order=commission_per_order,
+                    min_gross_notional=min_gross_notional,
+                    min_conviction=min_conviction,
                 )
             except Exception:
                 continue
@@ -2007,16 +2058,14 @@ def walk_forward_backtest(
             .fillna(0.0)
             .sum(axis=1)
         )
-        all_daily_pnl.append(fold_portfolio)
 
-        # Aggregate daily txn cost (at base bps) — lets callers re-price
-        # P&L at any cost level without re-running: cost scales linearly
-        # in bps for fixed turnover.
+        # Aggregate daily txn cost (bps component + fixed commissions) —
+        # lets callers stress-test P&L at higher cost levels without
+        # re-running the walk-forward.
         fold_cost = (
             pd.concat(fold_pair_costs, axis=1).fillna(0.0).sum(axis=1)
             if fold_pair_costs else pd.Series(0.0, index=fold_portfolio.index)
         )
-        all_daily_cost.append(fold_cost)
 
         # Aggregate gross exposure across all concurrently open pairs.
         # Each pair sizes itself independently at risk_per_trade of AUM,
@@ -2025,7 +2074,25 @@ def walk_forward_backtest(
             pd.concat(fold_pair_gross, axis=1).fillna(0.0).sum(axis=1)
             if fold_pair_gross else pd.Series(0.0, index=fold_portfolio.index)
         )
+
+        # Portfolio gross cap: pro-rata scale P&L, cost, and gross on days
+        # the book exceeds cap × AUM. This approximates sizing entries down
+        # when the book is crowded (a live system should enforce this at
+        # entry time — see the daily_run path). Per-trade pnls in
+        # fold_trades stay UNSCALED and are diagnostics only.
+        if max_gross_over_aum_cap:
+            gross_cap = aum * max_gross_over_aum_cap
+            with np.errstate(divide="ignore"):
+                scale = np.minimum(
+                    1.0, gross_cap / fold_gross.replace(0.0, np.inf)
+                )
+            fold_portfolio = fold_portfolio * scale
+            fold_cost = fold_cost * scale
+            fold_gross = fold_gross * scale
+
+        all_daily_cost.append(fold_cost)
         all_daily_gross.append(fold_gross)
+        all_daily_pnl.append(fold_portfolio)
 
         fold_results.append({
             "fold":           fold_start,
@@ -2192,6 +2259,12 @@ async def run_walk_forward_backtest(
     test_months: int = 3,
     transaction_cost_bps: float = 5.0,
     max_holding_bars: int = 20,
+    commission_per_order: float = 1.0,
+    min_gross_notional: float = 5000.0,
+    min_conviction: float = 0.25,
+    max_pairs_per_fold: int = 10,
+    max_gross_over_aum_cap: float = 1.5,
+    risk_per_trade: float = 0.02,
 ):
     """Run the walk-forward backtest and return per-fold + overall metrics."""
     parquet_path = "data/df_clean.parquet"
@@ -2206,6 +2279,12 @@ async def run_walk_forward_backtest(
             test_months=test_months,
             transaction_cost_bps=transaction_cost_bps,
             max_holding_bars=max_holding_bars,
+            commission_per_order=commission_per_order,
+            min_gross_notional=min_gross_notional,
+            min_conviction=min_conviction,
+            max_pairs_per_fold=max_pairs_per_fold,
+            max_gross_over_aum_cap=max_gross_over_aum_cap,
+            risk_per_trade=risk_per_trade,
         ),
     )
 
