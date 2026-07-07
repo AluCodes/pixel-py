@@ -1598,6 +1598,35 @@ def backtest_pair_v2(
         signal.iloc[i] = current_pos
 
     # ----------------------------
+    # 6b) Force-close any position still open at the end of the series.
+    # Previously an open position simply vanished at the boundary: no trade
+    # record, no exit transaction cost. Now it is closed on the final bar,
+    # recorded with forced_close=True, and the leg is zeroed so the turnover
+    # cost below charges the liquidation.
+    # ----------------------------
+    if current_pos != 0 and entry_date is not None:
+        last_i = len(index) - 1
+        trades.append({
+            "entry_date": entry_date,
+            "exit_date": index[last_i],
+            "direction": "Long Spread" if current_pos == +1 else "Short Spread",
+            "entry_z": entry_z_val,
+            "exit_z": zscore.iloc[last_i],
+            "entry_beta": entry_beta,
+            "exit_beta": rolling_beta.iloc[last_i],
+            "entry_gross": entry_gross,
+            "entry_price_tom": entry_price_tom,
+            "entry_price_jerry": entry_price_jerry,
+            "exit_price_tom": prices_tom.iloc[last_i],
+            "exit_price_jerry": prices_jerry.iloc[last_i],
+            "forced_close": True,
+        })
+        leg_tom.iloc[last_i] = 0.0
+        leg_jerry.iloc[last_i] = 0.0
+        gross_exposure.iloc[last_i] = 0.0
+        signal.iloc[last_i] = 0
+
+    # ----------------------------
     # 7) P&L from actual leg returns
     # ----------------------------
     tom_ret = prices_tom.pct_change().fillna(0.0)
@@ -1672,6 +1701,12 @@ def _find_best_exit_z(
     best_score = -np.inf
     best_result = None
 
+    # Minimum closed trades before we trust a Sharpe estimate at all.
+    # Below this, the score is shrunk proportionally instead of rewarded —
+    # the old `n_trades * sharpe` score actively selected the churn config
+    # (127 one-day trades, Sharpe 0.02) over the best config (Sharpe 0.37).
+    MIN_TRADES = 20
+
     for ez in exit_z_candidates:
         result = walk_forward_backtest(
             prices_wide,
@@ -1682,14 +1717,16 @@ def _find_best_exit_z(
             max_holding_bars=max_holding_bars,
         )
         portfolio = result.get("portfolio", pd.Series(dtype=float))
-        # log(f"_find_best_exit_z::exit_z={ez}, portfolio={portfolio}") #alutest
         if isinstance(portfolio, pd.Series) and not portfolio.empty and portfolio.std() > 0:
             # AUM cancels in mean/std ratio, so Sharpe is scale-invariant
             sharpe = float((portfolio.mean() * 252) / (portfolio.std() * np.sqrt(252)))
         else:
             sharpe = 0.0
         n_trades = sum(f["n_trades"] for f in result.get("folds", []))
-        score = n_trades * sharpe if sharpe > 0 else -np.inf
+        # Sharpe is already computed on cost-adjusted P&L. Shrink toward 0
+        # when the sample is too small to trust; never reward trade count.
+        sample_weight = min(1.0, n_trades / MIN_TRADES)
+        score = sharpe * sample_weight if sharpe > 0 else -np.inf
 
         # log(f"_find_best_exit_z::result={result}") #alutest
 
@@ -1703,6 +1740,7 @@ def _find_best_exit_z(
                 f" | exit {t['exit_date']} z={t['exit_z']:.3f}"
                 f" tom={t.get('exit_price_tom', float('nan')):.4f} jerry={t.get('exit_price_jerry', float('nan')):.4f}"
                 f" | holding={t.get('holding_days')} pnl={t.get('pnl', 0.0):.2f}"
+                + (" | FORCED_CLOSE" if t.get("forced_close") else "")
             )
 
         if score > best_score or best_result is None:
@@ -1848,8 +1886,13 @@ def walk_forward_backtest(
             if pair_tom not in test_prices.columns or pair_jerry not in test_prices.columns:
                 continue
 
-            # Prefix test window with enough train history for warmup
-            warmup_bars = max(beta_lookback, z_lookback, vol_lookback) + 5
+            # Prefix test window with enough train history for warmup.
+            # NOTE: lookbacks CHAIN, they don't overlap — the spread needs
+            # beta_lookback bars of beta first, then the z-score/vol need
+            # z_lookback/vol_lookback bars of *valid spread* on top of that.
+            # Using max() here starved every fold of signals except the last
+            # ~5 bars, which is why entries clustered just before month-end.
+            warmup_bars = beta_lookback + max(z_lookback, vol_lookback) + 10
             warmup = train_prices.iloc[-warmup_bars:]
             combined = pd.concat([warmup, test_prices])
 
@@ -1938,7 +1981,8 @@ def walk_forward_backtest(
         return {"folds": [], "portfolio": pd.DataFrame(), "metrics": {}}
 
     portfolio_pnl = pd.concat(all_daily_pnl).sort_index()
-    metrics = _compute_backtest_metrics(portfolio_pnl, aum)
+    all_trades = [t for f in fold_results for t in f.get("trades", [])]
+    metrics = _compute_backtest_metrics(portfolio_pnl, aum, trades=all_trades)
     # log(f"\n\n>>>>>walk_forward_backtest::aum={aum}, portfolio_pnl={portfolio_pnl}") #alutest
 
     return {
@@ -1971,8 +2015,23 @@ def _apply_holding_stop(
     return pnl
 
 
-def _compute_backtest_metrics(daily_pnl: pd.Series, aum: float) -> Dict[str, Any]:
-    """Sharpe, Calmar, max drawdown, win rate from a daily P&L series."""
+def _compute_backtest_metrics(
+    daily_pnl: pd.Series,
+    aum: float,
+    trades: Optional[List[dict]] = None,
+) -> Dict[str, Any]:
+    """Sharpe, Sortino, Calmar, drawdowns, and win rates from daily P&L + trades.
+
+    Fixes vs the previous version:
+    - win_rate is now a PER-TRADE win rate computed from the trades list.
+      The old version computed the fraction of positive nonzero daily-portfolio
+      P&L days, which (a) was mislabeled and (b) was nearly invariant across
+      exit_z configs because active days barely changed — hence the frozen
+      0.3636 in the sweep logs. The daily figure is kept as daily_hit_rate.
+    - Sortino ratio added (annualized return / downside deviation).
+    - max_drawdown reported both in dollars and as % of AUM so it is
+      comparable with ann_return.
+    """
     if daily_pnl.empty or daily_pnl.std() == 0:
         return {}
 
@@ -1981,31 +2040,71 @@ def _compute_backtest_metrics(daily_pnl: pd.Series, aum: float) -> Dict[str, Any
     ann_vol   = daily_ret.std()  * np.sqrt(252)
     sharpe    = ann_ret / ann_vol if ann_vol > 0 else 0.0
 
+    # Sortino: penalize only downside volatility. Downside deviation uses
+    # all days (zeros included) with negative deviations from 0 (MAR = 0).
+    downside = daily_ret.clip(upper=0.0)
+    downside_dev = float(np.sqrt((downside ** 2).mean()) * np.sqrt(252))
+    sortino = ann_ret / downside_dev if downside_dev > 0 else 0.0
+
     cum = daily_pnl.cumsum()
     running_max = cum.cummax()
     drawdown = cum - running_max
     max_dd   = float(drawdown.min())
-    calmar   = ann_ret / abs(max_dd / aum) if max_dd != 0 else 0.0
+    max_dd_pct = max_dd / aum
+    calmar   = ann_ret / abs(max_dd_pct) if max_dd != 0 else 0.0
 
+    # Daily hit rate on active days (kept, but no longer labeled win_rate)
     nonzero = daily_pnl[daily_pnl != 0]
-    win_rate = float((nonzero > 0).mean()) if len(nonzero) > 0 else 0.0
+    daily_hit_rate = float((nonzero > 0).mean()) if len(nonzero) > 0 else 0.0
 
-    return {
-        "ann_return":   round(ann_ret,  4),
-        "ann_vol":      round(ann_vol,  4),
-        "sharpe":       round(sharpe,   4),
-        "calmar":       round(calmar,   4),
-        "max_drawdown": round(max_dd,   2),
-        "win_rate":     round(win_rate, 4),
-        "total_pnl":    round(float(daily_pnl.sum()), 2),
-        "n_days":       len(daily_pnl),
+    # True per-trade win rate from closed trades
+    win_rate = None
+    n_trades = None
+    avg_win = avg_loss = profit_factor = None
+    if trades:
+        pnls = [float(t.get("pnl", 0.0)) for t in trades if "pnl" in t]
+        if pnls:
+            n_trades = len(pnls)
+            wins   = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p < 0]
+            win_rate = len(wins) / n_trades
+            avg_win  = float(np.mean(wins))   if wins   else 0.0
+            avg_loss = float(np.mean(losses)) if losses else 0.0
+            gross_win  = sum(wins)
+            gross_loss = abs(sum(losses))
+            profit_factor = (gross_win / gross_loss) if gross_loss > 0 else float("inf")
+
+    out = {
+        "ann_return":       round(ann_ret,  4),
+        "ann_vol":          round(ann_vol,  4),
+        "sharpe":           round(sharpe,   4),
+        "sortino":          round(sortino,  4),
+        "calmar":           round(calmar,   4),
+        "max_drawdown":     round(max_dd,   2),
+        "max_drawdown_pct": round(max_dd_pct, 4),
+        "daily_hit_rate":   round(daily_hit_rate, 4),
+        "total_pnl":        round(float(daily_pnl.sum()), 2),
+        "n_days":           len(daily_pnl),
     }
+    if win_rate is not None:
+        out.update({
+            "win_rate":      round(win_rate, 4),
+            "n_trades":      n_trades,
+            "avg_win":       round(avg_win, 2),
+            "avg_loss":      round(avg_loss, 2),
+            "profit_factor": round(profit_factor, 3) if profit_factor != float("inf") else None,
+        })
+    return out
 
 
 @router.get("/walk_forward_backtest")
 async def run_walk_forward_backtest(
     train_months: int = 24,
-    test_months: int = 1,
+    # 3-month test folds: with 1-month folds every position hit the fold
+    # boundary within ~21 bars, systematically truncating mean reversion.
+    # Longer folds let trades complete; forced closes are now recorded
+    # and costed either way (see backtest_pair_v2 step 6b).
+    test_months: int = 3,
     transaction_cost_bps: float = 5.0,
     max_holding_bars: int = 20,
 ):
